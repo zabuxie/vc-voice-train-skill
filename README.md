@@ -1,4 +1,4 @@
-# rvc-voice-train-skill
+# vc-voice-train-skill
 
 DeepSeek Harness (DSH) skill: train RVC voice models from voice clips — with dataset QA, a fix for the RVC 20240604 audio-norm defect, objective quality acceptance, and a full troubleshooting table.
 
