@@ -806,7 +806,40 @@ node qq/qq_voice.mjs send-group <群号> "要说的话"
 > - `record` 消息段同时接受 **mp3 和 wav**（mp3 体积小 7 倍）
 > - 大模型推理 + QQ 发送，5 秒内的短句约 5 秒完成
 
-## 17. 两条路线怎么选（再强调一次）
+## 17. 插件补丁维护（重要）
+
+插件的语言自动切换和双后端切换靠补丁实现，见 `patches-index.mjs.diff` /
+`patches-client.js.diff`。
+
+### 17.1 补丁会被 DSH 重启抹掉
+
+**DSH 重启时按 `package-lock.json` 重装 `node_modules`，所有手工改动被还原。**
+症状：日文又开始跳词（走中文驱动 → 只读出 1/3 → RVC 输出变短）。
+
+### 17.2 三重保障
+
+| 机制 | 做法 |
+|---|---|
+| **备份** | 打完补丁后 `cp lib/index.mjs lib/index.mjs.langpatch.bak` |
+| **自检+自愈** | `POST /dsh-tts-api/backend-control?name=rvc&action=lang-patch-restore`<br>缺补丁就从 `.bak` 恢复，返回 `changed:true` 时需重启 DSH |
+| **状态查询** | `?action=lang-patch-status` → `{present, hasBackup}` |
+
+界面上的「快速切换后端」按钮会在切换时**自动调用 restore**，
+所以只要点一次按钮，补丁丢了也会自动补回。
+
+### 17.3 手工兜底
+
+```bash
+<RVC>/runtime/python.exe <skill>/scripts/apply_lang_patch.py
+```
+
+幂等：已打过输出 `[SKIP]`，没打过就自动补上。
+
+> ⚠️ 验证补丁是否在：
+> `grep -c pickBaseVoice lib/index.mjs`，**应 ≥ 3**（定义 1 + RVC 链路 1 + Edge 链路 1）。
+> 为 0 就是被还原了。
+
+## 18. 两条路线怎么选（再强调一次）
 
 | 你的情况 | 选 |
 |---|---|

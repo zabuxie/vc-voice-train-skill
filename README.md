@@ -99,10 +99,18 @@ Point dsh-plugin-tts at provider "Index-TTS2", address `http://127.0.0.1:7880`.
 
 Two unified diffs for `@memef1f1y/dsh-plugin-tts@0.6.7`:
 
-- `patches-index.mjs.diff` — host: per-request language auto-switch (a zh voice cannot
-  read kana: 0.24 s near-silent → 2.6 s after the fix) + `/dsh-tts-api/backend-control`
-  to start/stop either backend (they cannot share an 8 GB card).
-- `patches-client.js.diff` — UI: one-click "切换后端" button with live status.
+- `patches-index.mjs.diff` — host side:
+  - **language auto-switch**: a `zh-CN` voice cannot read kana (measured: 0.24 s of
+    near-silence vs 2.6 s correct). Detects kana / hangul / cyrillic / arabic / thai in
+    the text and picks the matching Edge driver voice per request.
+  - **`/dsh-tts-api/backend-control`**: start / stop either backend, resolve its PID
+    from the listening port, and report `lang-patch` status.
+  - **`lang-patch-status` / `lang-patch-restore`**: DSH reinstalls `node_modules` on
+    restart, which silently reverts manual patches. These actions detect that and
+    restore from `index.mjs.langpatch.bak`.
+- `patches-client.js.diff` — UI: a "快速切换后端" button that stops one backend, starts
+  the other (they cannot share an 8 GB card), switches the provider, waits for
+  readiness, and shows live status + patch health.
 
 Apply from the package root (`patch -p1`, Git Bash / WSL / `patch.exe`):
 
@@ -110,6 +118,9 @@ Apply from the package root (`patch -p1`, Git Bash / WSL / `patch.exe`):
 cd <node_modules>/@memef1f1y/dsh-plugin-tts
 patch -p1 < <skill>/rvc-voice-train/patches-index.mjs.diff
 patch -p1 < <skill>/rvc-voice-train/patches-client.js.diff
+
+# keep a known-good copy so the self-heal action can restore it after a reinstall:
+cp lib/index.mjs lib/index.mjs.langpatch.bak
 ```
 
 ## Requirements / 环境要求
