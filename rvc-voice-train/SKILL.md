@@ -1,10 +1,33 @@
 ---
 name: rvc-voice-train
-description: 用视频/音频训练 RVC 音色并部署让 AI 用该声音朗读。包含素材质量判定、RVC 归一化缺陷修复、40k/32k 训练、faiss 索引、音质验收与常见故障排查。当用户说"训练一个音色/声音"、"让AI用某个人的声音说话"、"训个RVC"、"克隆声音"时使用。
-whenToUse: 用户提供了人声素材（视频/音频/游戏语音）并希望训练成可复用的 TTS 音色，或需要排查 RVC 训练音质问题（噪声/电音/发闷）时使用。
+description: 让 AI 用指定人物的声音说话：两条路线——RVC 音色训练（素材→训练→变声）与 IndexTTS 零样本克隆（参考音频→直接合成）。含素材质量判定、归一化缺陷修复、音高校准、确定性采样、音质验收、跨语种方案选型。当用户说"训练一个音色/声音"、"让AI用某个人的声音说话"、"训个RVC"、"克隆声音"、"中文不自然/音调太高"时使用。
+whenToUse: 用户提供了人声素材（视频/音频/游戏语音）并希望让 AI 用该声音说话；或需要排查已有音色的音质问题（噪声/电音/发闷/跨语种不连贯/音调偏高/声调不稳）时使用。
 ---
 
-# RVC 音色训练
+# AI 音色克隆（RVC 训练 + IndexTTS 零样本）
+
+让 AI 用指定人物的声音说话。两条技术路线，**先看选型再动手**。
+
+---
+
+## 路线选型（先看这个表）
+
+| 需求 | 推荐 | 原因 |
+|---|---|---|
+| **跨语种**（如日语素材说中文） | **IndexTTS** | RVC 音素缺失，跨语种必然不连贯 |
+| **音色高度还原**（同语种） | **RVC** | 训练过，音色更准 |
+| **音调可精确控制** | **RVC** | 音高由驱动音频决定 |
+| **零训练、快速上线** | **IndexTTS** | 一段参考音频即可 |
+| **需要情感/语气控制** | IndexTTS | 支持情感参考音频 |
+
+> **实测对照**（同一素材：日语 CV 素材训多萝西）：
+> - RVC 说日语：音色准、自然 ✅
+> - RVC 说中文：**不连贯**（素材无中文音素）❌
+> - IndexTTS 说中文：**连贯自然**，但音调偏高（可校准）✅
+
+---
+
+## 第一部分：RVC 音色训练
 
 把一段人声素材训练成 RVC 音色，供 TTS 使用（如 dsh-plugin-tts 的 RVC provider）。
 
@@ -596,3 +619,181 @@ hz  = 700 * (exp(mel/1127) - 1)
 - ❌ 只靠 flat 判断音质（要配合频段分布 + 谐波纯度）
 - ❌ 把多个同名模型放在 weights 目录（字母序抢占）
 - ❌ 认为 `loss_disc` 1e8 是"正常的对抗训练震荡"（那是缺陷信号）
+
+---
+
+# 第二部分：IndexTTS 零样本克隆（跨语种首选）
+
+**不训练**，给一段参考音频就能合成目标音色。跨语种能力远超 RVC。
+
+## 10. 安装
+
+### 10.1 硬件
+
+| 项 | 要求 |
+|---|---|
+| 显存 | **≥ 6 GB**（8G 卡可跑，自动低显存模式） |
+| 磁盘 | ~20 GB（环境 8G + 模型 5.2G） |
+| Python | **3.10~3.11**（3.12+ 不支持） |
+
+### 10.2 步骤
+
+```bash
+# 1. 装 uv（比 pip 快很多）
+curl -L -o uv.zip https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip
+# 解压得到 uv.exe
+
+# 2. 装 Python 3.11（uv 自带下载慢时，用 gh 下构建包）
+#    gh release download 20261021 --repo astral-sh/python-build-standalone \
+#      --pattern "*cpython-3.11*install_only_stripped.tar.gz" --dir .
+#    tar -xzf <包名>
+
+# 3. 克隆源码
+git clone --depth 1 https://github.com/index-tts/index-tts.git
+
+# 4. 建环境（走清华镜像，否则 PyTorch 下载极慢）
+cd index-tts
+export UV_CACHE_DIR=<ENV_ROOT>/cache UV_PYTHON_DOWNLOADS=never
+../uv/uv.exe venv --python <python3.11路径>
+../uv/uv.exe sync --python .venv/Scripts/python.exe \
+  --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 5. 装适配器额外依赖
+../uv/uv.exe pip install fastapi uvicorn --python .venv/Scripts/python.exe \
+  --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+### 10.3 下载模型（5.2 GB）
+
+从 [IndexTeam/IndexTTS-2.5](https://huggingface.co/IndexTeam/IndexTTS-2.5) 下到 `checkpoints/`：
+
+| 文件 | 大小 |
+|---|---|
+| `gpt.pth` | **3.1 GB** |
+| `s2mel.pth` | 396 MB |
+| `codec.pth` | 579 MB |
+| `qwen0.6bemo4-merge/model.safetensors` | **1.1 GB** |
+| `config.yaml` / `feat1.pt` / `feat2.pt` / `bpe.model` / `wav2vec2bert_stats.pt` | 小文件 |
+
+> ⚠️ **仓库里没有 `bpe.model` 和 `campplus_cn_common.bin`**（我按常见文件名猜的，实测 404）。
+> 只有上面列出的 22 个文件。`campplus`/`bigvgan` 会在首次加载时自动下到 `checkpoints/hf_cache/`。
+>
+> ⚠️ **hf-mirror 会限流**：并发下载小文件会 403。大文件串行、小文件带重试。
+
+### 10.4 部署适配器
+
+把 `indextts/adapter.py` 放到 `<ENV_ROOT>/indextts/`，参考音色放 `<ENV_ROOT>/voices/`：
+
+```
+<ENV_ROOT>/
+├── index-tts/          源码 + .venv
+├── checkpoints/        模型权重（或 index-tts/checkpoints）
+├── voices/             参考音色 *.wav
+└── indextts/
+    ├── adapter.py
+    ├── 启动IndexTTS.cmd
+    └── launch_hidden.vbs
+```
+
+启动：**双击 `启动IndexTTS.cmd`**（或 `wscript launch_hidden.vbs`）。
+
+## 11. 音高校准（最容易被忽略的一步）
+
+**IndexTTS 的输出音高 ≈ 参考音频的音高。** 参考选错，合成出来就"音调太高"。
+
+### 11.1 用脚本挑参考
+
+```bash
+<RVC>/runtime/python.exe scripts/pick_pitch_ref.py <素材目录> \
+  --out <ENV_ROOT>/voices --name myvoice --f0-min 300 --f0-max 380
+```
+
+输出每个片段的中位 f0 / P10 / P90 / 波动，按 P90 升序排列。
+
+### 11.2 判定标准
+
+| 指标 | 含义 | 参考值 |
+|---|---|---|
+| **中位 f0** | 整体音高 | 成年女声日常说话 **200~260 Hz**；偏高音色 300~380 |
+| **P90** | 高音峰值，决定刺耳感 | **越低越稳**；> 500 Hz 会明显发尖 |
+| 时长 | 太短学不稳 | **≥ 5 秒**，10~30 秒最佳 |
+
+**实测对照（同一句中文，输出音高）**：
+
+| 参考 | 参考中位/P90 | 输出中位/P90 | 听感 |
+|---|---|---|---|
+| 高音台词 | 396 / 556 Hz | **441 / 525 Hz** | ❌ 偏尖 |
+| 中等台词 | 353 / 496 Hz | 350 / 507 Hz | ⚠️ 可接受但偶有尖 |
+| 平稳片段 | 313 / 441 Hz | 320 / 384 Hz | ✅ 自然 |
+
+> **规律：输出中位 ≈ 参考中位（接近 1:1）。** 想要什么音高，就挑什么音高的参考。
+
+## 12. 确定性采样（解决声调忽好忽坏）
+
+**问题**：同一句话每次合成，末尾声调不同。实测"试"字的去声斜率在
+**-7.7 / -1.8 / -0.2** 之间跳动（-0.2 就是听感"读平了"）。
+
+**根因**：`do_sample=true` + 支持扩散采样，每次随机种子不同。
+
+**修复**（适配器已内置）：
+
+```python
+# 1) 强制 do_sample=False
+# 2) 每次合成前固定种子
+random.seed(seed); np.random.seed(seed)
+torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+```
+
+> ⚠️ **只设 `do_sample=False` 不够**——实测三次输出 MD5 仍不同（内部还有其他随机源）。
+> **必须同时固定种子**才能完全可复现。
+>
+> 验证方法：连续合成 3 次同一句话，输出 MD5 应完全一致。
+
+## 13. 适配器要点（踩过的坑）
+
+| 坑 | 现象 | 解决 |
+|---|---|---|
+| **pydantic 可选字段** | 插件传 `null` 报 **422** | 用 `Optional[str] = None`，不能写 `str = None` |
+| **emoji 编码** | 文本含 🌙 报 **500 GBK 错误** | ① `sys.stdout.reconfigure(encoding='utf-8', errors='replace')` ② 清洗 emoji |
+| **低显存分段** | 8G 卡 >40 字强制切段，停顿怪 | 把 `split_text_by_punctuation` 阈值从 40 调到 **90** |
+| **完全关闭分段** | 63 字合成出现 **12.7 秒静音** | 不要关，只调阈值；90 字是实测可用值 |
+| **进程随父退出** | 脚本一关服务就死 | 用 **VBScript + `WScript.Shell.Run`**（`Start-Process` 仍会跟着死） |
+| **WinError 1455** | 加载模型时报"页面文件太小" | 关 QQ/浏览器/音乐播放器；适配器自己占 **5.2 GB 内存** |
+| **首次加载慢** | 30~60 秒无响应 | 正常，模型加载 + 预热 |
+
+## 14. 音高/声调自查脚本
+
+| 脚本 | 用途 |
+|---|---|
+| `scripts/pick_pitch_ref.py` | 挑参考音频（按中位 f0 + P90 排序） |
+| `scripts/probe_accept.py` | 输出 vs 真值验收（谐波纯度/频段） |
+
+## 15. QQ 语音桥接（可选）
+
+把合成结果发到 QQ 语音消息（需要 [NapCat](https://github.com/NapNeko/NapCatQQ)）：
+
+```bash
+node qq/qq_voice.mjs send <QQ号> "要说的话"
+node qq/qq_voice.mjs send-group <群号> "要说的话"
+```
+
+前置：NapCat 开着 WebSocket（默认 `ws://127.0.0.1:3001`）+ ffmpeg。
+
+> - NapCat 的 `can_send_record` 应为 `{yes: true}`
+> - `record` 消息段同时接受 **mp3 和 wav**（mp3 体积小 7 倍）
+> - 大模型推理 + QQ 发送，5 秒内的短句约 5 秒完成
+
+## 16. 两条路线怎么选（再强调一次）
+
+| 你的情况 | 选 |
+|---|---|
+| 素材是**外语**，要它说中文 | **IndexTTS**（RVC 必然不连贯） |
+| 素材和目标语言一致 | **RVC**（音色更准） |
+| 想要**低音**的跨语种效果 | RVC（驱动音频决定音高）；或 IndexTTS 挑低音参考 |
+| 不想训练 | IndexTTS |
+| 8G 显存 | 都行（IndexTTS 5.2G 内存 + 5G 显存；RVC 更省） |
+
+> **两者不能同时占显卡**：IndexTTS ~5 GB，RVC ~2-3 GB，8G 卡装不下两个。
+> 切换时要停一个起另一个（见 `patches-index.mjs.diff` 里的 `backend-control` 路由 +
+> `patches-client.js.diff` 里的「快速切换后端」按钮；启动脚本路径由 `DSH_RVC_START` /
+> `DSH_INDEX_START` 环境变量提供）。

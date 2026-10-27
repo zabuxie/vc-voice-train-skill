@@ -1,0 +1,118 @@
+--- a/lib/index.mjs
++++ b/lib/index.mjs
+@@ -12,7 +12,7 @@
+ // (Sec-MS-GEC query-param protocol, mirroring node-edge-tts@1.2.10;
+ // 2026-10 v1->v2 migration per rany2/edge-tts#490: WSS host is now
+ // api.msedgeservices.com with Ocp-Apim-Subscription-Key, legacy token kept).
+-import { spawn } from 'node:child_process';
++import { spawn, execFileSync } from 'node:child_process';
+ import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+ import { createHash } from 'node:crypto';
+ import { request as httpRequest } from 'node:http';
+@@ -2462,6 +2462,106 @@
+     }
+   });
+ 
++  // ---- DSH: 后端进程管理（启动/停止 RVC 与 IndexTTS 适配器）----
++  // 8G 显存无法同时驻留两个后端，切换 provider 时需要连带启停服务。
++  // 浏览器不能起本地进程，所以由插件宿主代为执行。
++  // 后端启动脚本路径由环境变量提供，避免把个人路径写死：
++  //   DSH_RVC_START    RVC 服务启动脚本（.cmd）
++  //   DSH_INDEX_START  IndexTTS 适配器启动脚本（.cmd）
++  //   DSH_RVC_CWD      RVC 工作目录（可选）
++  //   DSH_INDEX_CWD    IndexTTS 工作目录（可选）
++  const BACKENDS = {
++    rvc: {
++      name: 'RVC 变声服务',
++      port: 4892,
++      startCmd: process.env.DSH_RVC_START || '',
++      cwd: process.env.DSH_RVC_CWD || '',
++    },
++    index: {
++      name: 'IndexTTS 适配器',
++      port: 7880,
++      startCmd: process.env.DSH_INDEX_START || '',
++      cwd: process.env.DSH_INDEX_CWD || '',
++    },
++  };
++
++  function backendPid(name) {
++    const spec = BACKENDS[name];
++    if (!spec) return null;
++    try {
++      const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8', timeout: 8000 });
++      const re = new RegExp(':' + spec.port + '\\s+\\S+\\s+LISTENING\\s+(\\d+)');
++      const m = out.match(re);
++      return m ? Number(m[1]) : null;
++    } catch (e) {
++      return null;
++    }
++  }
++
++  const backendDisposer = webServer.register({
++    kind: 'exact',
++    path: '/dsh-tts-api/backend-control',
++    async handler(req, res) {
++      const q = new URL(req.url || '', 'http://x').searchParams;
++      const name = String(q.get('name') || '');
++      const action = String(q.get('action') || 'status');
++      const spec = BACKENDS[name];
++      if (!spec) {
++        writeErr(res, 400, '未知后端：' + name, { code: 'host.badBackend' });
++        return;
++      }
++      const pid = backendPid(name);
++      if (action === 'status') {
++        writeJson(res, 200, { ok: true, name, running: pid !== null, pid });
++        return;
++      }
++      if (action === 'stop') {
++        if (pid === null) {
++          writeJson(res, 200, { ok: true, name, running: false, message: spec.name + ' 本来就没在运行' });
++          return;
++        }
++        try {
++          execFileSync('taskkill', ['/F', '/PID', String(pid)], { timeout: 10000 });
++          writeJson(res, 200, { ok: true, name, running: false, pid, message: spec.name + ' 已停止' });
++        } catch (e) {
++          writeErr(res, 500, '停止失败：' + String((e && e.message) || e).slice(0, 200), { code: 'host.stopFail' });
++        }
++        return;
++      }
++      if (action === 'start') {
++        if (pid !== null) {
++          writeJson(res, 200, { ok: true, name, running: true, pid, message: spec.name + ' 已在运行' });
++          return;
++        }
++        if (!existsSync(spec.startCmd)) {
++          writeErr(res, 500, '启动脚本不存在：' + spec.startCmd, { code: 'host.noStartScript' });
++          return;
++        }
++        try {
++          // 用 detached + unref 让服务脱离插件进程存活
++          const [cmd, ...args] = /\.cmd$/i.test(spec.startCmd)
++            ? ['cmd.exe', '/c', spec.startCmd]
++            : [spec.startCmd];
++          const child = spawn(cmd, args, {
++            cwd: spec.cwd,
++            detached: true,
++            stdio: 'ignore',
++            windowsHide: true,
++          });
++          child.unref();
++          writeJson(res, 200, {
++            ok: true, name, running: true, pid: child.pid,
++            message: spec.name + ' 启动中（首次加载模型约 30-60 秒）'
++          });
++        } catch (e) {
++          writeErr(res, 500, '启动失败：' + String((e && e.message) || e).slice(0, 200), { code: 'host.startFail' });
++        }
++        return;
++      }
++      writeErr(res, 400, '未知操作：' + action, { code: 'host.badAction' });
++    },
++  });
++
+   const filesDisposer = webServer.register({
+     kind: 'exact',
+     path: '/dsh-tts-api/rvc-files',

@@ -1,0 +1,125 @@
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -4446,6 +4446,68 @@
+           saveSettings();
+           setProvider(e.target.value);
+         };
++        // ---- DSH: 一键切换音色后端（RVC <-> Index-TTS2）----
++        // 两个后端在 8G 显存上无法同时驻留，切换时提示用户到后台启停对应服务。
++        const [switchState, setSwitchState] = react.useState({ rvc: null, idx: null, busy: false, msg: "" });
++        const probeBackend = async () => {
++          const one = async (url) => {
++            try {
++              const r = await fetch(url.replace(/\/+$/, "") + "/health", { cache: "no-store" });
++              return r.ok ? true : false;
++            } catch (e) { return false; }
++          };
++          const rvcUrl = (shared.rvc && shared.rvc.baseUrl) || "http://127.0.0.1:4892";
++          const idxUrl = (shared.index && shared.index.baseUrl) || "http://127.0.0.1:7880";
++          const [rvc, idx] = await Promise.all([one(rvcUrl), one(idxUrl)]);
++          setSwitchState(s => ({ ...s, rvc, idx }));
++          return { rvc, idx };
++        };
++        react.useEffect(() => {
++          probeBackend();
++          const t = setInterval(probeBackend, 8000);
++          return () => clearInterval(t);
++        }, []);
++        const switchBackend = async () => {
++          const target = shared.provider === "index-tts2" ? "rvc" : "index-tts2";
++          const label = target === "rvc" ? "RVC 变声" : "本地音色(IndexTTS)";
++          const backend = target === "rvc" ? "rvc" : "index";
++          const otherBackend = target === "rvc" ? "index" : "rvc";
++          setSwitchState(s => ({ ...s, busy: true, msg: "正在切换服务，请稍候…" }));
++          const calls = [];
++          // 1) 停掉另一个后端，释放显存
++          calls.push(fetch("/dsh-tts-api/backend-control?name=" + otherBackend + "&action=stop", { method: "POST" })
++            .then(r => r.json()).catch(() => ({ ok: false })));
++          // 2) 启动目标后端
++          calls.push(fetch("/dsh-tts-api/backend-control?name=" + backend + "&action=start", { method: "POST" })
++            .then(r => r.json()).catch(() => ({ ok: false })));
++          const [stopRes, startRes] = await Promise.all(calls);
++          // 3) 切换 provider
++          shared.provider = target;
++          saveSettings();
++          setProvider(target);
++          // 4) 等服务起来（最多 40 秒）
++          let up = false;
++          for (let i = 0; i < 20; i++) {
++            await new Promise(r => setTimeout(r, 2000));
++            const st = await probeBackend();
++            up = target === "rvc" ? st.rvc : st.idx;
++            if (up) break;
++            setSwitchState(s => ({ ...s, msg: "等待 " + label + " 就绪… (" + (i + 1) * 2 + "s)" }));
++          }
++          const stopMsg = stopRes && stopRes.message ? stopRes.message : "";
++          const startMsg = startRes && startRes.message ? startRes.message : "";
++          let msg;
++          if (up) {
++            msg = "✅ 已切到 " + label + "，服务在线。" + (stopMsg ? " " + stopMsg : "");
++          } else if (startRes && startRes.ok) {
++            msg = "⚠️ " + label + " 已启动但尚未就绪（IndexTTS 首次加载需 30-60 秒）。" +
++              (stopMsg ? " " + stopMsg : "") + " 稍等片刻后点「刷新」确认。";
++          } else {
++            msg = "❌ " + label + " 启动失败：" + (startMsg || "未知原因") +
++              (stopMsg ? "（" + stopMsg + "）" : "");
++          }
++          setSwitchState(s => ({ ...s, busy: false, msg }));
++        };
+         const setRvc = (key, value) => {
+           shared.rvc[key] = value;
+           saveSettings();
+@@ -6965,6 +7027,53 @@
+               ),
+             ),
+           ),
++          // ---- DSH: 一键切换音色后端 ----
++          react.createElement(
++            "div",
++            { className: "dsh-tts-module" },
++            react.createElement(
++              "div",
++              { className: "dsh-tts-module-info" },
++              react.createElement(
++                "div",
++                { className: "dsh-tts-module-title" },
++                "快速切换后端",
++              ),
++              react.createElement(
++                "div",
++                { className: "dsh-tts-module-desc" },
++                switchState.rvc === null && switchState.idx === null
++                  ? "检测后端状态中…"
++                  : (
++                    (switchState.rvc ? "RVC 在线" : "RVC 离线") +
++                    " · " +
++                    (switchState.idx ? "IndexTTS 在线" : "IndexTTS 离线") +
++                    " · 当前：" + (provider === "index-tts2" ? "IndexTTS" : provider === "rvc" ? "RVC" : provider)
++                  ),
++              ),
++            ),
++            react.createElement(
++              "button",
++              {
++                type: "button",
++                className: "dsh-tts-select",
++                disabled: switchState.busy,
++                onClick: switchBackend,
++                title: "在 RVC 与 Index-TTS2 之间切换（8G 显存下两者不能同时运行）",
++                style: { cursor: switchState.busy ? "wait" : "pointer", minWidth: "150px" },
++              },
++              switchState.busy
++                ? "切换中…"
++                : (provider === "index-tts2" ? "→ 切到 RVC" : "→ 切到 IndexTTS"),
++            ),
++          ),
++          switchState.msg
++            ? react.createElement(
++                "div",
++                { className: "dsh-tts-module-desc", style: { padding: "0 4px 8px", lineHeight: "1.5" } },
++                switchState.msg,
++              )
++            : null,
+           overlaySection,
+           scrollFollowSection,
+           notifySection,
