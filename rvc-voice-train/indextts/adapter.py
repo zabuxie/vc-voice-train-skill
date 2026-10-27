@@ -9,50 +9,30 @@ dsh-plugin-tts <- IndexTTS-2.5 适配器
 
 它把请求翻译成 IndexTTS-2.5 的 Python 调用（进程内，模型常驻）。
 
-部署位置（默认）：
-    <ENV_ROOT>/index-tts/       IndexTTS 源码 + .venv
-    <ENV_ROOT>/checkpoints/     模型权重（或用 index-tts/checkpoints）
-    <ENV_ROOT>/voices/          参考音色（wav/mp3/flac）
+启动：
+    E:\\rvc_train\\indextts_env\\index-tts\\.venv\\Scripts\\python.exe adapter.py
 
-环境变量（都可选）：
-    INDEX_TTS_ENV_ROOT  部署根目录，默认脚本所在目录的上一级
-    INDEX_TTS_PORT      监听端口，默认 7880
-    INDEX_TTS_VOICE_DIR 参考音色目录，默认 <ENV_ROOT>/voices
-    INDEX_TTS_CHUNK_CHARS 低显存分段阈值，默认 90（0=不分段）
-    INDEX_TTS_INTERVAL_MS 段间静音毫秒，默认 120
-    INDEX_TTS_DO_SAMPLE 置 1 恢复随机采样（默认确定性）
-    INDEX_TTS_SEED      固定种子，默认 1234
-
+参考音色放这里（wav/mp3/flac）：
+    E:\\rvc_train\\indextts_env\\voices\\<名字>.wav
 请求体里的 prompt_audio 可以是：
-    - 音色名（不带扩展名）  例如 "myvoice"
+    - 音色名（不带扩展名）  例如 "dorothy"
     - 绝对路径
     - 留空 -> 用默认音色（voices 目录里第一个）
 """
 import io
 import os
+import re
 import sys
 import time
 import traceback
 import glob
 from typing import Optional
 
-# ENV_ROOT 默认取「本脚本所在目录的上一级」；放在 indextts/ 子目录时需指到部署根。
-_HERE = os.path.dirname(os.path.abspath(__file__))
-ENV_ROOT = os.environ.get('INDEX_TTS_ENV_ROOT') or (
-    os.path.dirname(_HERE) if os.path.basename(_HERE) == 'indextts' else _HERE
-)
-ROOT = os.path.join(ENV_ROOT, 'index-tts')
-# 模型权重：优先 <ENV_ROOT>/checkpoints，其次 index-tts/checkpoints
-_CKPT_A = os.path.join(ENV_ROOT, 'checkpoints')
-_CKPT_B = os.path.join(ROOT, 'checkpoints')
-CKPT = _CKPT_A if os.path.isdir(_CKPT_A) else _CKPT_B
-VOICE_DIR = os.environ.get('INDEX_TTS_VOICE_DIR') or os.path.join(ENV_ROOT, 'voices')
-PORT = int(os.environ.get('INDEX_TTS_PORT', '7880'))
-
-if not os.path.isdir(ROOT):
-    sys.stderr.write('[FATAL] 找不到 IndexTTS 源码目录：%s\n'
-                     '        请设 INDEX_TTS_ENV_ROOT 指向部署根目录。\n' % ROOT)
-    sys.exit(1)
+ROOT = r'E:\rvc_train\indextts_env\index-tts'
+ENV_ROOT = r'E:\rvc_train\indextts_env'
+VOICE_DIR = os.path.join(ENV_ROOT, 'voices')
+CKPT = os.path.join(ROOT, 'checkpoints')
+PORT = 7880
 
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
@@ -209,6 +189,9 @@ class TTSRequest(BaseModel):
     emo_weight: float = 0.65
     emo_text: Optional[str] = None
     emo_random: bool = False
+    # 8 维情感向量：喜 怒 哀 惧 厌恶 低落 惊喜 平静
+    # emo_control_method==2 时生效；传 None 则按标点自动推断
+    emo_vector: Optional[list] = None
     max_text_tokens_per_segment: int = 120
     # 确定性采样：同一句话每次输出完全一致，避免末尾声调忽正忽平（实测随机
     # 采样时"试"字的去声斜率在 -7.7 ~ -0.2 之间跳动）。可用 INDEX_TTS_DO_SAMPLE=1 恢复。
@@ -222,8 +205,55 @@ class TTSRequest(BaseModel):
     max_mel_tokens: int = 1500
 
 
+# 情感向量顺序（IndexTTS 固定）：喜 怒 哀 惧 厌恶 低落 惊喜 平静
+EMO_NAMES = ['喜', '怒', '哀', '惧', '厌恶', '低落', '惊喜', '平静']
+
+
+def infer_emotion_from_punct(text):
+    """
+    按句子末尾标点推断情感向量。
+
+    规则（保守，先让语气有点变化，不追求夸张）：
+        问号 ? ？            -> 疑问：平静 0.55 + 惊喜 0.15（好奇上扬）
+        感叹号 ! ！          -> 亢奋：喜 0.35 + 惊喜 0.45
+        多个感叹 !! ！！！   -> 更强烈：喜 0.5 + 惊喜 0.5
+        省略号 … ...         -> 犹豫/低落：低落 0.35 + 平静 0.35
+        波浪号 ~ ～          -> 轻松愉快：喜 0.4 + 平静 0.3
+        句号 。.             -> 平静 0.6（默认陈述）
+        无标点               -> 平静 0.6
+
+    注意：这里只看整段文本的最后一个有效标点，不逐句分析——
+    IndexTTS 是整段合成，逐句切分会让停顿变怪。
+    """
+    t = (text or '').strip()
+    if not t:
+        return [0, 0, 0, 0, 0, 0, 0, 0.6]
+
+    # 去掉结尾引号/括号再看标点
+    tail = t.rstrip('"\'」』）)】》')
+
+    vec = [0.0] * 8
+    if re.search(r'[!！]{2,}$', tail):
+        vec[0] = 0.50   # 喜
+        vec[6] = 0.50   # 惊喜
+    elif tail.endswith(('!', '！')):
+        vec[0] = 0.35
+        vec[6] = 0.45
+    elif tail.endswith(('?', '？')):
+        vec[7] = 0.55   # 平静
+        vec[6] = 0.15   # 惊喜（一点好奇）
+    elif re.search(r'[….。]{2,}$', tail) or tail.endswith(('…', '...')):
+        vec[5] = 0.35   # 低落
+        vec[7] = 0.35   # 平静
+    elif tail.endswith(('~', '～')):
+        vec[0] = 0.40
+        vec[7] = 0.30
+    else:
+        vec[7] = 0.60   # 平静（默认）
+    return vec
+
+
 def post_process(wav_path):
-    """读 wav -> 峰值归一到 0.89，削波保护"""
     d, sr = sf.read(wav_path, always_2d=False)
     if d.ndim > 1:
         d = d.mean(axis=1)
@@ -309,6 +339,15 @@ def tts_tasks(req: TTSRequest):
     out = os.path.join(out_dir, 'tts_%d.wav' % int(time.time() * 1000))
 
     t0 = time.time()
+    # 情感向量：请求里显式给了就用请求的；否则按标点自动推断
+    # （INDEX_TTS_EMO=0 可关闭自动推断，退回模型默认）
+    if req.emo_vector is not None:
+        _emo_vec = list(req.emo_vector) if isinstance(req.emo_vector, (list, tuple)) else None
+    elif os.environ.get('INDEX_TTS_EMO', '1') == '1':
+        _emo_vec = infer_emotion_from_punct(text)
+    else:
+        _emo_vec = None
+
     try:
         model.infer(
             spk_audio_prompt=ref,
@@ -317,7 +356,7 @@ def tts_tasks(req: TTSRequest):
             lang=lang,
             emo_audio_prompt=(req.emo_ref_path or None),
             emo_alpha=float(req.emo_weight or 1.0),
-            emo_vector=None,
+            emo_vector=_emo_vec,
             use_emo_text=bool(req.emo_text) and req.emo_control_method == 3,
             emo_text=(req.emo_text or None),
             use_random=bool(req.emo_random),
